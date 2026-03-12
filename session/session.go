@@ -49,10 +49,6 @@ func (s *Session) Serve() error {
 	// Set read/write deadlines
 	s.Conn.SetDeadline(time.Now().Add(60 * time.Second))
 	
-	// Start heartbeat to detect dead connections
-	s.wg.Add(1)
-	go s.heartbeatLoop()
-	
 	// Start writer goroutine
 	s.wg.Add(1)
 	go s.writerLoop()
@@ -68,44 +64,6 @@ func (s *Session) Serve() error {
 	s.cleanup()
 	
 	return err
-}
-
-func (s *Session) heartbeatLoop() {
-	defer s.wg.Done()
-	
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-ticker.C:
-			s.closeMu.RLock()
-			if s.closed {
-				s.closeMu.RUnlock()
-				return
-			}
-			s.closeMu.RUnlock()
-			
-			// Check if connection is idle for too long
-			s.mu.RLock()
-			idle := time.Since(s.lastActivity) > 90*time.Second
-			s.mu.RUnlock()
-			
-			if idle {
-				s.Config.GetLogger().Info("closing idle connection", "idle_time", time.Since(s.lastActivity))
-				s.cancel()
-				return
-			}
-			
-			// Send ping (if supported by websocket package)
-			if err := websocket.Message.Send(s.Conn, "ping"); err != nil {
-				return
-			}
-			
-		case <-s.Context.Done():
-			return
-		}
-	}
 }
 
 func (s *Session) writerLoop() {
