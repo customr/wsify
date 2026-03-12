@@ -1,4 +1,4 @@
-module github.com/alash3al/wsify
+module github.com/customr/wsify
 
 go 1.22.0
 

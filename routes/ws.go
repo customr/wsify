@@ -1,13 +1,17 @@
 package routes
 
 import (
+	"context"
 	"github.com/alash3al/wsify/broker"
 	"github.com/alash3al/wsify/config"
 	"github.com/alash3al/wsify/session"
 	"github.com/alash3al/wsify/utils"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/net/websocket"
+	"io"
 	"net/http"
+	"strings"
+	"time"
 )
 
 func WebsocketRouteHandler(cfg *config.Config, brokerConn broker.Driver) echo.HandlerFunc {
@@ -29,30 +33,43 @@ func WebsocketRouteHandler(cfg *config.Config, brokerConn broker.Driver) echo.Ha
 			return c.NoContent(http.StatusForbidden)
 		}
 
-		return echo.WrapHandler(websocket.Server{
-			Handshake: func(c *websocket.Config, request *http.Request) error { return nil },
-			Handler: websocket.Handler(func(conn *websocket.Conn) {
-				sess := session.Session{
-					Context:      conn.Request().Context(),
-					Broker:       brokerConn,
-					Config:       cfg,
-					Conn:         conn,
-					DoneChannels: make(map[string]chan struct{}),
-					ErrChan:      make(chan error),
-					Writer:       make(chan []byte),
-				}
+		websocketHandler := websocket.Handler(func(conn *websocket.Conn) {
+			ctx, cancel := context.WithTimeout(c.Request().Context(), 24*time.Hour)
+			defer cancel()
 
-				go (func() {
-					for err := range sess.ErrChan {
-						cfg.GetLogger().Error(err.Error(), "func", "sessionErrorListener")
-					}
-				})()
+			sess := &session.Session{
+				Context:      ctx,
+				Broker:       brokerConn,
+				Config:       cfg,
+				Conn:         conn,
+				DoneChannels: make(map[string]chan struct{}),
+				ErrChan:      make(chan error, 100),
+				Writer:       make(chan []byte, 100),
+			}
 
-				if err := sess.Serve(); err != nil {
+			if err := sess.Serve(); err != nil {
+				if !isWebSocketClosedError(err) && err != io.EOF && err != context.Canceled {
 					cfg.GetLogger().Error(err.Error(), "func", "session.Serve")
-					return
 				}
-			}),
+			}
+		})
+
+		return echo.WrapHandler(websocket.Server{
+			Handshake: func(cfg *websocket.Config, req *http.Request) error {
+				return nil
+			},
+			Handler: websocketHandler,
 		})(c)
 	}
+}
+
+func isWebSocketClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "closed") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "connection reset by peer")
 }
