@@ -2,20 +2,20 @@ package routes
 
 import (
 	"context"
-	"github.com/alash3al/wsify/broker"
-	"github.com/alash3al/wsify/config"
-	"github.com/alash3al/wsify/session"
-	"github.com/alash3al/wsify/utils"
+	"github.com/customr/wsify/broker"
+	"github.com/customr/wsify/config"
+	"github.com/customr/wsify/session"
+	"github.com/customr/wsify/utils"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/net/websocket"
-	"io"
 	"net/http"
-	"strings"
 	"time"
+	"strings"
 )
 
 func WebsocketRouteHandler(cfg *config.Config, brokerConn broker.Driver) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		// Authorize connection
 		canConnect, err := utils.ShouldAcceptPayload(cfg.GetAuthorizerEndpointURL(), session.Message{
 			Command: session.MessageCommandTypeConnect,
 			Args: map[string]any{
@@ -23,53 +23,45 @@ func WebsocketRouteHandler(cfg *config.Config, brokerConn broker.Driver) echo.Ha
 				"query":   c.QueryParams(),
 			},
 		})
-
+		
 		if err != nil {
-			cfg.GetLogger().Error(err.Error(), "utils.ShouldAcceptPayload")
+			cfg.GetLogger().Error("authorization error", "error", err)
 			return c.NoContent(http.StatusForbidden)
 		}
-
+		
 		if !canConnect {
 			return c.NoContent(http.StatusForbidden)
 		}
-
-		websocketHandler := websocket.Handler(func(conn *websocket.Conn) {
+		
+		// Upgrade to WebSocket
+		websocket.Handler(func(conn *websocket.Conn) {
+			// Create context with timeout
 			ctx, cancel := context.WithTimeout(c.Request().Context(), 24*time.Hour)
 			defer cancel()
-
-			sess := &session.Session{
-				Context:      ctx,
-				Broker:       brokerConn,
-				Config:       cfg,
-				Conn:         conn,
-				DoneChannels: make(map[string]chan struct{}),
-				ErrChan:      make(chan error, 100),
-				Writer:       make(chan []byte, 100),
-			}
-
+			
+			// Create session
+			sess := session.NewSession(ctx, brokerConn, cfg, conn)
+			
+			// Serve session
 			if err := sess.Serve(); err != nil {
-				if !isWebSocketClosedError(err) && err != io.EOF && err != context.Canceled {
-					cfg.GetLogger().Error(err.Error(), "func", "session.Serve")
+				// Don't log normal closures as errors
+				if !isNormalWebSocketClose(err) {
+					cfg.GetLogger().Error("session serve error", "error", err)
 				}
 			}
-		})
-
-		return echo.WrapHandler(websocket.Server{
-			Handshake: func(cfg *websocket.Config, req *http.Request) error {
-				return nil
-			},
-			Handler: websocketHandler,
-		})(c)
+		}).ServeHTTP(c.Response(), c.Request())
+		
+		return nil
 	}
 }
 
-func isWebSocketClosedError(err error) bool {
+func isNormalWebSocketClose(err error) bool {
 	if err == nil {
-		return false
+		return true
 	}
 	errStr := err.Error()
-	return strings.Contains(errStr, "use of closed network connection") ||
-		strings.Contains(errStr, "closed") ||
-		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "connection reset by peer")
+	return errStr == "EOF" ||
+		strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "connection closed") ||
+		strings.Contains(errStr, "broken pipe")
 }

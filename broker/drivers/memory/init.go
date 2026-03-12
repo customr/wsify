@@ -1,7 +1,7 @@
 package memorybroker
 
 import (
-	"github.com/alash3al/wsify/broker"
+	"github.com/customr/wsify/broker"
 )
 
 const name = "memory"

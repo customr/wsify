@@ -2,8 +2,8 @@ package routes
 
 import (
 	"encoding/json"
-	"github.com/alash3al/wsify/broker"
-	"github.com/alash3al/wsify/config"
+	"github.com/customr/wsify/broker"
+	"github.com/customr/wsify/config"
 	"github.com/labstack/echo/v4"
 	"net/http"
 	"strings"
