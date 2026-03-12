@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"net"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +28,6 @@ type Session struct {
 	wg           sync.WaitGroup
 	closed       bool
 	closeMu      sync.RWMutex
-	lastActivity time.Time
 	pingTicker   *time.Ticker
 }
 
@@ -43,16 +41,18 @@ func NewSession(ctx context.Context, broker broker.Driver, cfg *config.Config, c
 		Conn:         conn,
 		DoneChannels: make(map[string]chan struct{}),
 		ErrChan:      make(chan error, 100),
-		Writer:       make(chan []byte, 100),
-		lastActivity: time.Now(),
+		Writer:       make(chan []byte, 1000), // Increased buffer for better throughput
 	}
 }
 
 func (s *Session) Serve() error {
-	// Set initial deadlines
-	s.Conn.SetDeadline(time.Now().Add(60 * time.Second))
+	// DISABLE ALL DEADLINES - connections should stay open indefinitely
+	// This is key for clients that only listen and don't send messages
+	s.Conn.SetDeadline(time.Time{})
+	s.Conn.SetReadDeadline(time.Time{})
+	s.Conn.SetWriteDeadline(time.Time{})
 
-	// Start heartbeat
+	// Start heartbeat to keep connection alive through proxies
 	s.pingTicker = time.NewTicker(30 * time.Second)
 	s.wg.Add(1)
 	go s.heartbeatLoop()
@@ -65,35 +65,33 @@ func (s *Session) Serve() error {
 	s.wg.Add(1)
 	go s.errorHandlerLoop()
 
-	// Main message processing loop
-	err := s.messageLoop()
+	// Start message reader (optional - only if clients might send messages)
+	// For pure server-push, you could even skip this entirely
+	s.wg.Add(1)
+	go s.messageReader()
+
+	// Wait for context cancellation
+	<-s.Context.Done()
 
 	// Cleanup
 	s.cleanup()
 
-	return err
+	return nil
 }
 
+// heartbeatLoop sends periodic pings to keep the connection alive through proxies
 func (s *Session) heartbeatLoop() {
 	defer s.wg.Done()
 
 	for {
 		select {
 		case <-s.pingTicker.C:
-			// Check if connection is stale
-			s.mu.Lock()
-			idle := time.Since(s.lastActivity) > 60*time.Second
-			s.mu.Unlock()
-
-			if idle {
-				s.Config.GetLogger().Debug("connection idle, sending ping")
-				// Send a ping message (or any small message)
-				s.Conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if err := websocket.Message.Send(s.Conn, `{"type":"ping"}`); err != nil {
-					// Ping failed, connection is probably dead
-					s.cancel()
-					return
-				}
+			// Send a ping message - this keeps the connection alive
+			// and helps detect dead connections
+			if err := s.safeWrite([]byte(`{"type":"ping"}`)); err != nil {
+				// Ping failed, connection is probably dead
+				s.cancel()
+				return
 			}
 		case <-s.Context.Done():
 			return
@@ -101,6 +99,19 @@ func (s *Session) heartbeatLoop() {
 	}
 }
 
+// safeWrite handles write operations with proper error handling
+func (s *Session) safeWrite(data []byte) error {
+	// Don't set any deadlines for writes
+	if err := websocket.Message.Send(s.Conn, string(data)); err != nil {
+		if !s.isNormalCloseError(err) {
+			s.Config.GetLogger().Error("write error", "error", err)
+		}
+		return err
+	}
+	return nil
+}
+
+// writerLoop handles messages from the Writer channel
 func (s *Session) writerLoop() {
 	defer s.wg.Done()
 
@@ -111,18 +122,8 @@ func (s *Session) writerLoop() {
 				return
 			}
 
-			// Set write deadline for this message
-			if err := s.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				s.safeSendError(err)
-				return
-			}
-
-			if err := websocket.Message.Send(s.Conn, string(output)); err != nil {
-				// Only log non-EOF errors
-				if !s.isNormalCloseError(err) {
-					s.Config.GetLogger().Error("write error", "error", err)
-				}
-				// Trigger cleanup on write error
+			if err := s.safeWrite(output); err != nil {
+				// On write error, cancel the session
 				s.cancel()
 				return
 			}
@@ -130,6 +131,61 @@ func (s *Session) writerLoop() {
 		case <-s.Context.Done():
 			return
 		}
+	}
+}
+
+// messageReader handles incoming messages from clients
+// Made optional - you can remove this if clients never send messages
+func (s *Session) messageReader() {
+	defer s.wg.Done()
+
+	// Create a separate goroutine for reading without deadlines
+	for {
+		select {
+		case <-s.Context.Done():
+			return
+		default:
+			var msg Message
+			// This will block until a message is received or connection breaks
+			// No deadlines means it will block forever if no messages arrive
+			err := websocket.JSON.Receive(s.Conn, &msg)
+
+			if err != nil {
+				// If there's an error reading, check if it's fatal
+				if !s.isNormalCloseError(err) && !errors.Is(err, io.EOF) {
+					s.Config.GetLogger().Error("read error", "error", err)
+				}
+				// On any read error, cancel the session
+				// This handles cases where the client disconnects
+				s.cancel()
+				return
+			}
+
+			// Process the message in a separate goroutine to not block reading
+			go s.processMessage(msg)
+		}
+	}
+}
+
+// processMessage handles individual messages from clients
+func (s *Session) processMessage(msg Message) {
+	// Authorize message
+	canProceed, err := utils.ShouldAcceptPayload(s.Config.GetAuthorizerEndpointURL(), msg)
+	if err != nil {
+		s.safeSendError(err)
+		return
+	}
+
+	if !canProceed {
+		return
+	}
+
+	// Handle command
+	switch msg.Command {
+	case MessageCommandTypeJoin:
+		s.onJoin(msg)
+	case MessageCommandTypeLeave:
+		s.onLeave(msg)
 	}
 }
 
@@ -148,66 +204,6 @@ func (s *Session) errorHandlerLoop() {
 			}
 		case <-s.Context.Done():
 			return
-		}
-	}
-}
-
-func (s *Session) messageLoop() error {
-	for {
-		// Reset read deadline before each read
-		if err := s.Conn.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
-			return err
-		}
-
-		var msg Message
-		err := websocket.JSON.Receive(s.Conn, &msg)
-
-		// Update last activity on any receive attempt
-		s.mu.Lock()
-		s.lastActivity = time.Now()
-		s.mu.Unlock()
-
-		if err != nil {
-			// Handle different types of errors
-			if s.isNormalCloseError(err) {
-				return nil // Normal closure, exit cleanly
-			}
-
-			if errors.Is(err, io.EOF) {
-				return nil // Client disconnected
-			}
-
-			// Check for timeout errors
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Timeout is expected, just continue and wait for next message
-				continue
-			}
-
-			// For other errors, send to error channel but continue
-			s.safeSendError(err)
-			continue
-		}
-
-		// Process valid message
-		s.Message = msg
-
-		// Authorize message
-		canProceed, err := utils.ShouldAcceptPayload(s.Config.GetAuthorizerEndpointURL(), s.Message)
-		if err != nil {
-			s.safeSendError(err)
-			continue
-		}
-
-		if !canProceed {
-			continue
-		}
-
-		// Handle command
-		switch s.Message.Command {
-		case MessageCommandTypeJoin:
-			s.onJoin()
-		case MessageCommandTypeLeave:
-			s.onLeave()
 		}
 	}
 }
@@ -249,9 +245,6 @@ func (s *Session) cleanup() {
 		s.pingTicker.Stop()
 	}
 
-	// Cancel context to stop all goroutines
-	s.cancel()
-
 	// Close all subscription channels
 	s.mu.Lock()
 	for channel, doneCh := range s.DoneChannels {
@@ -290,8 +283,8 @@ func (s *Session) cleanup() {
 	s.Config.GetLogger().Info("session cleaned up", "channels", len(s.DoneChannels))
 }
 
-func (s *Session) onJoin() {
-	channel := s.Message.GetArgsChannel()
+func (s *Session) onJoin(msg Message) {
+	channel := msg.GetArgsChannel()
 
 	if channel == "" {
 		s.safeSendError(errors.New("empty channel name"))
@@ -301,14 +294,11 @@ func (s *Session) onJoin() {
 	// Check if already subscribed
 	s.mu.Lock()
 	if done, exists := s.DoneChannels[channel]; exists {
-		// Verify subscription is still active by non-blocking check
 		select {
 		case done <- struct{}{}:
-			// Old subscription still active, close it first
 			close(done)
 			delete(s.DoneChannels, channel)
 		default:
-			// Channel is blocked or closed, create new one
 			delete(s.DoneChannels, channel)
 		}
 	}
@@ -342,30 +332,17 @@ func (s *Session) subscriptionHandler(channel string, feed <-chan []byte, done c
 		select {
 		case msg, ok := <-feed:
 			if !ok {
-				// Feed closed, subscription ended
 				return
 			}
 
-			// Try to send with timeout, but check context first
 			select {
 			case s.Writer <- msg:
 				// Success
 			case <-s.Context.Done():
 				return
-			case <-time.After(5 * time.Second):
-				// Writer channel full, check if connection is still alive
-				if !s.isConnectionAlive() {
-					return
-				}
-				s.Config.GetLogger().Warn("writer channel full, retrying", "channel", channel)
-				// Retry once
-				select {
-				case s.Writer <- msg:
-				case <-s.Context.Done():
-					return
-				case <-time.After(2 * time.Second):
-					s.Config.GetLogger().Warn("writer channel still full, dropping message", "channel", channel)
-				}
+			default:
+				// Writer channel full, log and continue
+				s.Config.GetLogger().Warn("writer channel full, message dropped", "channel", channel)
 			}
 
 		case <-done:
@@ -376,17 +353,8 @@ func (s *Session) subscriptionHandler(channel string, feed <-chan []byte, done c
 	}
 }
 
-func (s *Session) isConnectionAlive() bool {
-	// Try a non-blocking write to check connection
-	s.Conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	defer s.Conn.SetWriteDeadline(time.Time{})
-
-	err := websocket.Message.Send(s.Conn, `{"type":"ping"}`)
-	return err == nil
-}
-
-func (s *Session) onLeave() {
-	channel := s.Message.GetArgsChannel()
+func (s *Session) onLeave(msg Message) {
+	channel := msg.GetArgsChannel()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
