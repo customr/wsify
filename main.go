@@ -8,6 +8,7 @@ import (
 	"github.com/customr/wsify/routes"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"log"
 	"runtime"
 	"time"
 	"sync"
