@@ -37,7 +37,7 @@ func main() {
 
 	srv.Use(middleware.Recover())
 	srv.Use(middleware.CORS())
-	srv.Use(middleware.Logger())
+	// srv.Use(middleware.Logger())
 
 	srv.GET("/ws", func(c echo.Context) error {
 		atomic.AddInt64(&activeConnections, 1)
