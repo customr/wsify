@@ -245,7 +245,10 @@ func (s *Session) cleanup() {
 		s.pingTicker.Stop()
 	}
 
-	// Close all subscription channels
+	// Step 1: Cancel context FIRST to stop all goroutines
+	s.cancel()
+
+	// Step 2: Close all subscription channels (signals handlers to stop)
 	s.mu.Lock()
 	for channel, doneCh := range s.DoneChannels {
 		select {
@@ -257,10 +260,7 @@ func (s *Session) cleanup() {
 	}
 	s.mu.Unlock()
 
-	// Close writer channel
-	close(s.Writer)
-
-	// Wait for all goroutines with timeout
+	// Step 3: Wait for goroutines to finish with longer timeout
 	waitChan := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -270,14 +270,15 @@ func (s *Session) cleanup() {
 	select {
 	case <-waitChan:
 		// All goroutines finished
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second): // Increased timeout
 		s.Config.GetLogger().Warn("timeout waiting for goroutines to finish")
 	}
 
-	// Close error channel last
+	// Step 4: NOW it's safe to close channels
+	close(s.Writer)
 	close(s.ErrChan)
 
-	// Close connection
+	// Step 5: Close connection last
 	s.Conn.Close()
 
 	s.Config.GetLogger().Info("session cleaned up", "channels", len(s.DoneChannels))
@@ -326,6 +327,11 @@ func (s *Session) subscriptionHandler(channel string, feed <-chan []byte, done c
 		s.mu.Lock()
 		delete(s.DoneChannels, channel)
 		s.mu.Unlock()
+		
+		if r := recover(); r != nil {
+			s.Config.GetLogger().Error("recovered from panic in subscriptionHandler", 
+				"channel", channel, "panic", r)
+		}
 	}()
 
 	for {
@@ -341,8 +347,17 @@ func (s *Session) subscriptionHandler(channel string, feed <-chan []byte, done c
 			case <-s.Context.Done():
 				return
 			default:
-				// Writer channel full, log and continue
-				s.Config.GetLogger().Warn("writer channel full, message dropped", "channel", channel)
+				// Writer channel might be full or closed
+				// Check if session is still alive
+				select {
+				case <-s.Context.Done():
+					return
+				case s.Writer <- msg:
+					// Success on retry
+				case <-time.After(100 * time.Millisecond):
+					s.Config.GetLogger().Warn("writer channel unavailable, dropping message", 
+						"channel", channel)
+				}
 			}
 
 		case <-done:
