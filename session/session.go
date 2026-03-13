@@ -54,8 +54,8 @@ func (s *Session) Serve() error {
 
 	// Start heartbeat to keep connection alive through proxies
 	s.pingTicker = time.NewTicker(30 * time.Second)
-	s.wg.Add(1)
-	go s.heartbeatLoop()
+	// s.wg.Add(1)
+	// go s.heartbeatLoop()
 
 	// Start writer goroutine
 	s.wg.Add(1)
@@ -80,24 +80,24 @@ func (s *Session) Serve() error {
 }
 
 // heartbeatLoop sends periodic pings to keep the connection alive through proxies
-func (s *Session) heartbeatLoop() {
-	defer s.wg.Done()
+// func (s *Session) heartbeatLoop() {
+// 	defer s.wg.Done()
 
-	for {
-		select {
-		case <-s.pingTicker.C:
-			// Send a ping message - this keeps the connection alive
-			// and helps detect dead connections
-			if err := s.safeWrite([]byte(`{"type":"ping"}`)); err != nil {
-				// Ping failed, connection is probably dead
-				s.cancel()
-				return
-			}
-		case <-s.Context.Done():
-			return
-		}
-	}
-}
+// 	for {
+// 		select {
+// 		case <-s.pingTicker.C:
+// 			// Send a ping message - this keeps the connection alive
+// 			// and helps detect dead connections
+// 			if err := s.safeWrite([]byte(`{"type":"ping"}`)); err != nil {
+// 				// Ping failed, connection is probably dead
+// 				s.cancel()
+// 				return
+// 			}
+// 		case <-s.Context.Done():
+// 			return
+// 		}
+// 	}
+// }
 
 // safeWrite handles write operations with proper error handling
 func (s *Session) safeWrite(data []byte) error {
